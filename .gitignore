@@ -1,0 +1,14 @@
+# Віртуальне середовище Python
+.venv/
+venv/
+
+# Кеш Python
+__pycache__/
+*.pyc
+
+# Стара версія результатів (жовтень 2026) і журнал запуску
+results_v1/
+results/run_log.txt
+
+# Системні файли macOS
+.DS_Store
