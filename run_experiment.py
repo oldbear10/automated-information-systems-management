@@ -75,7 +75,7 @@ def _task_main(task):
     for st in sim.make_strategies():
         r = sim.simulate(st, load)
         kind, k = _kind(st)
-        out.append((noise, sc, st.name, kind, k, {m: r[m] for m, _ in METRICS}))
+        out.append((noise, sc, st.name, kind, k, seed, {m: r[m] for m, _ in METRICS}))
     return out
 
 
@@ -96,14 +96,15 @@ def _aggregate(key, runs):
 
 def run_main(pool):
     tasks = [(n, sc, s) for n in sim.NOISE_MODELS for sc in sim.SCENARIOS for s in range(N_RUNS)]
-    groups, info = defaultdict(list), {}
+    raw, info = defaultdict(dict), {}
     for chunk in pool.imap_unordered(_task_main, tasks, chunksize=4):
-        for noise, sc, name, kind, k, met in chunk:
-            groups[(noise, sc, name)].append(met)
+        for noise, sc, name, kind, k, seed, met in chunk:
+            raw[(noise, sc, name)][seed] = met
             info[(noise, sc, name)] = (kind, k)
     rows = []
-    for (noise, sc, name), runs in groups.items():
+    for (noise, sc, name), by_seed in raw.items():
         kind, k = info[(noise, sc, name)]
+        runs = [by_seed[s] for s in range(N_RUNS)]
         rows.append(_aggregate({"noise": noise, "scenario_key": sc, "scenario": sim.SCENARIOS[sc],
                                 "strategy": name, "kind": kind, "k": k}, runs))
     order = {n: i for i, n in enumerate(sim.NOISE_MODELS)}
@@ -111,7 +112,7 @@ def run_main(pool):
     kind_order = {"reactive": 0, "fixed": 1, "adaptive": 2}
     rows.sort(key=lambda r: (order[r["noise"]], sc_order[r["scenario_key"]],
                              kind_order[r["kind"]], r["k"] or 0))
-    return rows
+    return rows, raw
 
 
 def run_sensitivity(pool):
@@ -203,13 +204,123 @@ def sensitivity_table(sens, rows):
 
 
 # ---------------------------------------------------------------------------
+# Статистичне опрацювання: парний бутстреп по прогонах
+#   У кожній бутстреп-вибірці беремо ті самі номери прогонів (seed) для всіх
+#   стратегій — порівняння парне, бо стратегії працюють на однакових реалізаціях
+#   навантаження. Для кожної вибірки заново рахуємо середні, інтерполяцію
+#   "фіксований k за того самого SLO" і робастність. 95% ДІ — 2,5 і 97,5 процентилі.
+# ---------------------------------------------------------------------------
+B_BOOT = 2000
+BOOT_SEED = 2026
+
+
+def _boot_means(raw, idx):
+    """Середні метрик для кожної бутстреп-вибірки: {(noise, sc, name): {metric: array(B)}}."""
+    out = {}
+    for key, by_seed in raw.items():
+        out[key] = {}
+        for m in ("slo_violation_pct", "replica_hours", "scaling_actions"):
+            arr = np.array([by_seed[s][m] for s in range(N_RUNS)])
+            out[key][m] = arr[idx].mean(axis=1)
+    return out
+
+
+def _ci(values):
+    v = np.asarray([x for x in values if x is not None], dtype=float)
+    return float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5)), float(np.mean(v < 0)), len(v)
+
+
+def bootstrap(rows, raw):
+    idx = np.random.default_rng(BOOT_SEED).integers(0, N_RUNS, size=(B_BOOT, N_RUNS))
+    bm = _boot_means(raw, idx)
+    names = {(r["noise"], r["scenario_key"], r["kind"], r["k"]): r["strategy"] for r in rows}
+    out = {"equal_slo": {}, "robust": {}}
+    for noise in sim.NOISE_MODELS:
+        # 1) різниця ресурсів за однакового SLO, для кожного сценарію
+        for sc in sim.SCENARIOS:
+            a = bm[(noise, sc, names[(noise, sc, "adaptive", None)])]
+            fixed_keys = [(k, bm[(noise, sc, names[(noise, sc, "fixed", k)])]) for k in sim.K_GRID]
+            deltas, slos = [], []
+            for b in range(B_BOOT):
+                fixed = [{"k": k, "slo_violation_pct_mean": f["slo_violation_pct"][b],
+                          "replica_hours_mean": f["replica_hours"][b]} for k, f in fixed_keys]
+                res, _ = fixed_needed(fixed, a["slo_violation_pct"][b])
+                deltas.append(None if res is None else 100 * (a["replica_hours"][b] / res - 1))
+                slos.append(a["slo_violation_pct"][b])
+            out["equal_slo"][(noise, sc)] = {"delta": _ci(deltas), "slo": _ci(slos)}
+        # 2) робастність: найгірше SLO A–D і середня переплата, метод vs k = 0.30
+        worst = defaultdict(list)
+        over = defaultdict(list)
+        for b in range(B_BOOT):
+            base = {}
+            for s in SERVICES:
+                fixed = [{"k": k, "slo_violation_pct_mean": bm[(noise, s, names[(noise, s, "fixed", k)])]
+                          ["slo_violation_pct"][b],
+                          "replica_hours_mean": bm[(noise, s, names[(noise, s, "fixed", k)])]["replica_hours"][b]}
+                         for k in sim.K_GRID]
+                base[s] = fixed_needed(fixed, SLO_TARGET)[0]
+            for label, kind, k in (("adaptive", "adaptive", None), ("k=0.30", "fixed", 0.3)):
+                ms = [bm[(noise, s, names[(noise, s, kind, k)])] for s in SERVICES]
+                worst[label].append(max(m["slo_violation_pct"][b] for m in ms))
+                over[label].append(np.mean([100 * (m["replica_hours"][b] / base[s] - 1)
+                                            for m, s in zip(ms, SERVICES)]))
+        out["robust"][noise] = {
+            label: {"worst": _ci(worst[label]), "over": _ci(over[label])} for label in worst}
+        out["robust"][noise]["over_diff"] = _ci(np.array(over["k=0.30"]) - np.array(over["adaptive"]))
+        out["robust"][noise]["worst_diff"] = _ci(np.array(worst["adaptive"]) - np.array(worst["k=0.30"]))
+    return out
+
+
+def save_runs(raw, info_rows):
+    """Первинні дані: результат кожного прогону кожної стратегії."""
+    kinds = {(r["noise"], r["scenario_key"], r["strategy"]): (r["kind"], r["k"]) for r in info_rows}
+    with open(os.path.join(OUT, "runs.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["noise", "scenario", "strategy", "kind", "k", "seed"] + [m for m, _ in METRICS])
+        for (noise, sc, name), by_seed in sorted(raw.items()):
+            kind, k = kinds[(noise, sc, name)]
+            for s in range(N_RUNS):
+                w.writerow([noise, sc, name, kind, "" if k is None else k, s]
+                           + [by_seed[s][m] for m, _ in METRICS])
+
+
+def boot_lines(boot):
+    def f(ci, digits=1, sign=True):
+        lo, hi = ci[0], ci[1]
+        fmt = f"{{:{'+' if sign else ''}.{digits}f}}"
+        return f"[{fmt.format(lo)}; {fmt.format(hi)}]"
+
+    L = [f"\n## Статистичне опрацювання: 95% довірчі інтервали (парний бутстреп, {B_BOOT} вибірок)\n",
+         "Кожна бутстреп-вибірка — {0} прогонів, вибраних із поверненням; для всіх стратегій беруться ті самі "
+         "реалізації навантаження. «Частка вибірок < 0» — частка бутстреп-вибірок, у яких метод економніший.\n"
+         .format(N_RUNS)]
+    for noise, (_, title) in sim.NOISE_MODELS.items():
+        L += [f"\n### {title}: різниця ресурсів за однакового SLO\n",
+              "| Сценарій | SLO методу, % [95% ДІ] | Різниця ресурсів, % [95% ДІ] | Частка вибірок < 0 |",
+              "|---|---|---|---|"]
+        for sc in sim.SCENARIOS:
+            e = boot["equal_slo"][(noise, sc)]
+            L.append(f"| {sim.SCENARIOS[sc]} | {f(e['slo'], 2, False)} | {f(e['delta'])} | "
+                     f"{e['delta'][2]:.3f} |")
+        r = boot["robust"][noise]
+        L += [f"\n### {title}: робастність (сервіси A–D)\n",
+              "| Стратегія | Найгірше SLO, % [95% ДІ] | Середня переплата, % [95% ДІ] |",
+              "|---|---|---|",
+              f"| Метод (W = 60, q = 0.90) | {f(r['adaptive']['worst'], 2, False)} | {f(r['adaptive']['over'])} |",
+              f"| Фіксований k = 0.30 | {f(r['k=0.30']['worst'], 2, False)} | {f(r['k=0.30']['over'])} |",
+              f"\nРізниця переплати (k = 0.30 мінус метод), п. п.: {f(r['over_diff'])}; "
+              f"різниця найгіршого SLO (метод мінус k = 0.30), п. п.: {f(r['worst_diff'], 2)}."]
+    return L
+
+
+# ---------------------------------------------------------------------------
 # Таблиці
 # ---------------------------------------------------------------------------
 def fmt_delta(d):
     return "недосяжно при k ≤ 0.60" if d is None else f"{d:+.1f}"
 
 
-def save_tables(rows, sens_rows):
+def save_tables(rows, sens_rows, boot):
     with open(os.path.join(OUT, "summary.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
@@ -261,6 +372,7 @@ def save_tables(rows, sens_rows):
           "|---|---|---|---|---|---|"]
     L += [f"| {w} | {q:.2f} | {wo:.2f} | {ov:+.1f} | {vs:.2f} | {fmt_delta(dv)} |"
           for w, q, wo, ov, vs, dv in sens_rows]
+    L += boot_lines(boot)
     text = "\n".join(L)
     with open(os.path.join(OUT, "summary.md"), "w", encoding="utf-8") as f:
         f.write(text)
@@ -377,10 +489,12 @@ if __name__ == "__main__":
     os.makedirs(OUT, exist_ok=True)
     with Pool() as pool:
         print("Експерименти 1–3 ...")
-        rows = run_main(pool)
+        rows, raw = run_main(pool)
         print("Експеримент 4 (чутливість) ...")
         sens = run_sensitivity(pool)
-    save_tables(rows, sensitivity_table(sens, rows))
+    print("Статистичне опрацювання (бутстреп) ...")
+    save_runs(raw, rows)
+    save_tables(rows, sensitivity_table(sens, rows), bootstrap(rows, raw))
     plot_tradeoff(rows)
     plot_load()
     plot_timeline()
